@@ -146,3 +146,178 @@ def test_qwen3_generate_speed():
     print(f"Mean time: {mean_time*1000:.2f} ± {std_time*1000:.2f} ms")
     print(f"Min/Max: {times.min()*1000:.2f} / {times.max()*1000:.2f} ms")
     print(f"New tokens/sec: {total_new_tokens / mean_time:.2f}")
+
+
+def test_stop_tokens():
+    """Test that generation stops correctly when stop token IDs are encountered."""
+    model_name = "Qwen/Qwen3-0.6B"
+    tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
+    hf_model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="eager", use_safetensors=True)
+
+    # Test with prompts that should generate specific tokens
+    inputs = ["Hello", "The answer"]
+    batch = tokenizer(inputs, return_tensors="pt", padding=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        hf_model.save_pretrained(tmp, safe_serialization=True)
+        config = AutoConfig.from_pretrained(model_name)
+
+        mesh = jax.make_mesh((1, 1), ("dp", "tp"))
+        with jax.set_mesh(mesh):
+            model = Qwen3ForCausalLM(config, dtype=jnp.float32, rngs=nnx.Rngs(0))
+        load_safetensors(tmp, config, model)
+
+        # Use token ID that will likely appear early (comma token: 11)
+        sampling_params = [
+            types.SamplingParams(max_tokens=50, temperature=0.0, seed=42, stop=[11]),  # Stop on comma token
+            types.SamplingParams(max_tokens=50, temperature=0.0, seed=42, stop=[374, 11]),  # Multiple stop tokens
+        ]
+        result = model.generate(
+            batch.input_ids.numpy(),
+            batch.attention_mask.numpy(),
+            sampling_params=sampling_params,
+            tokenizer=tokenizer,
+        )
+
+        # Verify first sequence stopped at token 11
+        print(f"Sequence 1 tokens: {result.generated_ids[0]}")
+        print(f"Sequence 1 stop reason: {result.stop_reasons[0]}")
+        print(f"Sequence 1 text: '{tokenizer.decode(result.generated_ids[0])}'")
+
+        assert result.stop_reasons[0] == "stop", f"Expected stop reason 'stop' but got '{result.stop_reasons[0]}'"
+        assert result.generated_ids[0][-1] in [
+            11
+        ], f"Expected last token to be stop token, got {result.generated_ids[0][-1]}"
+
+        # Verify second sequence stopped at one of the stop tokens
+        print(f"Sequence 2 tokens: {result.generated_ids[1]}")
+        print(f"Sequence 2 stop reason: {result.stop_reasons[1]}")
+        print(f"Sequence 2 text: '{tokenizer.decode(result.generated_ids[1])}'")
+
+        assert result.stop_reasons[1] == "stop", f"Expected stop reason 'stop' but got '{result.stop_reasons[1]}'"
+        assert result.generated_ids[1][-1] in [
+            374,
+            11,
+        ], f"Expected last token to be one of stop tokens, got {result.generated_ids[1][-1]}"
+
+
+def test_stop_strings():
+    """Test that generation stops correctly when stop strings are encountered."""
+    model_name = "Qwen/Qwen3-0.6B"
+    tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
+    hf_model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="eager", use_safetensors=True)
+
+    # Test with a prompt that should trigger our stop string
+    inputs = ["The answer is: Yes"]
+    batch = tokenizer(inputs, return_tensors="pt", padding=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        hf_model.save_pretrained(tmp, safe_serialization=True)
+        config = AutoConfig.from_pretrained(model_name)
+
+        mesh = jax.make_mesh((1, 1), ("dp", "tp"))
+        with jax.set_mesh(mesh):
+            model = Qwen3ForCausalLM(config, dtype=jnp.float32, rngs=nnx.Rngs(0))
+        load_safetensors(tmp, config, model)
+
+        # Test with stop string
+        sampling_params = [
+            types.SamplingParams(
+                max_tokens=50, temperature=0.0, seed=42, stop_strings=[" is"]  # Should stop when " is" appears
+            ),
+        ]
+        result = model.generate(
+            batch.input_ids.numpy(),
+            batch.attention_mask.numpy(),
+            sampling_params=sampling_params,
+            tokenizer=tokenizer,
+        )
+
+        # Verify that generation stopped due to the stop string
+        generated_tokens = result.generated_ids[0]
+        generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=False)
+
+        print(f"Generated tokens: {generated_tokens}")
+        print(f"Generated text: '{generated_text}'")
+        print(f"Stop reason: {result.stop_reasons[0]}")
+
+        # The generation should have stopped when it encountered " is"
+        assert result.stop_reasons[0] == "stop", f"Expected stop reason 'stop' but got '{result.stop_reasons[0]}'"
+        assert " is" in generated_text, f"Stop string ' is' should be in generated text: '{generated_text}'"
+
+
+def test_no_stop_strings():
+    """Test that generation continues normally when no stop strings are provided."""
+    model_name = "Qwen/Qwen3-0.6B"
+    tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
+    hf_model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="eager", use_safetensors=True)
+
+    inputs = ["Hello world"]
+    batch = tokenizer(inputs, return_tensors="pt", padding=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        hf_model.save_pretrained(tmp, safe_serialization=True)
+        config = AutoConfig.from_pretrained(model_name)
+
+        mesh = jax.make_mesh((1, 1), ("dp", "tp"))
+        with jax.set_mesh(mesh):
+            model = Qwen3ForCausalLM(config, dtype=jnp.float32, rngs=nnx.Rngs(0))
+        load_safetensors(tmp, config, model)
+
+        # Test without stop strings
+        sampling_params = [
+            types.SamplingParams(
+                max_tokens=10,
+                temperature=0.0,
+                seed=42,
+            ),
+        ]
+        result = model.generate(
+            batch.input_ids.numpy(),
+            batch.attention_mask.numpy(),
+            sampling_params=sampling_params,
+            tokenizer=tokenizer,
+        )
+
+        # Should generate exactly max_tokens and stop due to length
+        assert len(result.generated_ids[0]) == 10, f"Expected 10 tokens but got {len(result.generated_ids[0])}"
+        assert result.stop_reasons[0] == "length", f"Expected stop reason 'length' but got '{result.stop_reasons[0]}'"
+
+
+def test_multiple_stop_strings():
+    """Test that generation stops when any of multiple stop strings are encountered."""
+    model_name = "Qwen/Qwen3-0.6B"
+    tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
+    hf_model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="eager", use_safetensors=True)
+
+    inputs = ["The capital"]
+    batch = tokenizer(inputs, return_tensors="pt", padding=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        hf_model.save_pretrained(tmp, safe_serialization=True)
+        config = AutoConfig.from_pretrained(model_name)
+
+        mesh = jax.make_mesh((1, 1), ("dp", "tp"))
+        with jax.set_mesh(mesh):
+            model = Qwen3ForCausalLM(config, dtype=jnp.float32, rngs=nnx.Rngs(0))
+        load_safetensors(tmp, config, model)
+
+        # Test with multiple stop strings
+        sampling_params = [
+            types.SamplingParams(max_tokens=50, temperature=0.0, seed=42, stop_strings=[" of", " is", "\n"]),
+        ]
+        result = model.generate(
+            batch.input_ids.numpy(),
+            batch.attention_mask.numpy(),
+            sampling_params=sampling_params,
+            tokenizer=tokenizer,
+        )
+
+        generated_text = tokenizer.decode(result.generated_ids[0], skip_special_tokens=False)
+
+        print(f"Generated text: '{generated_text}'")
+        print(f"Stop reason: {result.stop_reasons[0]}")
+
+        # Should stop when one of the stop strings is encountered
+        has_stop_string = any(stop_str in generated_text for stop_str in [" of", " is", "\n"])
+        assert has_stop_string, f"At least one stop string should be in generated text: '{generated_text}'"

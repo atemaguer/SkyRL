@@ -16,7 +16,7 @@ from flax.training import checkpoints
 
 
 import optax
-from transformers import AutoConfig
+from transformers import AutoConfig, AutoTokenizer
 from huggingface_hub import snapshot_download
 
 from tx.tinker.db_models import FutureDB, RequestStatus, CheckpointDB, CheckpointStatus
@@ -115,6 +115,9 @@ class TinkerEngine:
         logger.info(
             f"Initialized base model {self.config.base_model} with max_lora_adapters={self.config.max_lora_adapters}, max_lora_rank={self.config.max_lora_rank}"
         )
+
+        # Load tokenizer for stop string checking
+        self.tokenizer = AutoTokenizer.from_pretrained(self.config.base_model)
 
         self._create_loss_and_grad_fn()
 
@@ -591,7 +594,11 @@ class TinkerEngine:
         with jax.set_mesh(self.mesh):
             model = nnx.merge(self.graphdef, self.lora_params, self.non_lora_params)
             result = model.generate(
-                input_ids, attention_mask, sampling_params=all_sampling_params, adapter_indices=all_adapter_indices
+                input_ids,
+                attention_mask,
+                sampling_params=all_sampling_params,
+                adapter_indices=all_adapter_indices,
+                tokenizer=self.tokenizer,
             )
 
         all_sequences = [

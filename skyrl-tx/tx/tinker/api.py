@@ -16,7 +16,6 @@ import random
 
 from tx.tinker import types
 from tx.tinker.config import EngineConfig, add_model, config_to_argv
-from transformers import AutoTokenizer
 from tx.tinker.db_models import (
     CheckpointDB,
     ModelDB,
@@ -285,7 +284,7 @@ class SamplingParams(BaseModel):
     top_k: int = -1
     top_p: float = 1
 
-    def to_types(self, tokenizer=None) -> types.SamplingParams:
+    def to_types(self) -> types.SamplingParams:
         if self.max_tokens is None:
             raise HTTPException(status_code=400, detail="max_tokens is currently required")
 
@@ -297,26 +296,14 @@ class SamplingParams(BaseModel):
         # Generate a random seed if not provided
         seed = self.seed if self.seed is not None else random.randint(0, 2**31 - 1)
 
-        # Engine only supports integer token IDs
+        # Separate stop tokens and stop strings
         stop_tokens: Sequence[int] | None = None
+        stop_strings: Sequence[str] | None = None
         if self.stop is not None:
             if isinstance(self.stop, str):
-                if tokenizer is None:
-                    raise HTTPException(
-                        status_code=500, detail="Tokenizer not available for string stop sequence conversion"
-                    )
-                stop_tokens = tokenizer.encode(self.stop, add_special_tokens=False)
+                stop_strings = [self.stop]
             elif self.stop and isinstance(self.stop[0], str):
-                if tokenizer is None:
-                    raise HTTPException(
-                        status_code=500, detail="Tokenizer not available for string stop sequence conversion"
-                    )
-                # Only keep single-token results (multi-token stop sequences not yet supported)
-                stop_tokens = []
-                for stop_str in self.stop:
-                    tokens = tokenizer.encode(stop_str, add_special_tokens=False)
-                    if len(tokens) == 1:
-                        stop_tokens.append(tokens[0])
+                stop_strings = list(self.stop)
             else:
                 stop_tokens = self.stop
 
@@ -325,6 +312,7 @@ class SamplingParams(BaseModel):
             max_tokens=self.max_tokens,
             seed=seed,
             stop=stop_tokens,
+            stop_strings=stop_strings,
         )
 
 
@@ -591,26 +579,14 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
 
     if request.base_model:
         model_id = checkpoint_id = ""
-        base_model_name = request.base_model
     else:
         assert request.model_path is not None
         path = types.TinkerPath.parse(request.model_path)
         if not path or path.kind != "" or not (model_id := path.primary_id) or not (checkpoint_id := path.secondary_id):
             raise HTTPException(status_code=400, detail="model_path must be in format tinker://model_id/checkpoint_id")
-        model_db = await get_model(session, model_id)
-        base_model_name = model_db.base_model
+        await get_model(session, model_id)
         # Validate that the checkpoint exists and is ready
         await validate_checkpoint(req, model_id, checkpoint_id, types.CheckpointType.SAMPLER, session)
-
-    # Load tokenizer if needed for string stop sequences
-    tokenizer = None
-    if request.sampling_params.stop is not None:
-        needs_tokenizer = isinstance(request.sampling_params.stop, str) or (
-            len(request.sampling_params.stop) > 0 and isinstance(request.sampling_params.stop[0], str)
-        )
-        if needs_tokenizer:
-            # Use the base model from the request or from the model DB
-            tokenizer = AutoTokenizer.from_pretrained(base_model_name)
 
     request_id = await create_future(
         session=session,
@@ -619,7 +595,7 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
         request_data=types.SampleInput(
             base_model=request.base_model,
             prompt=request.prompt.to_types(),
-            sampling_params=request.sampling_params.to_types(tokenizer=tokenizer),
+            sampling_params=request.sampling_params.to_types(),
             num_samples=request.num_samples,
             checkpoint_id=checkpoint_id,
         ),

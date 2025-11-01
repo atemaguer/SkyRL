@@ -112,6 +112,7 @@ class GeneratorMixin:
         *,
         sampling_params: list[types.SamplingParams],
         adapter_indices: jax.Array | None = None,
+        tokenizer=None,
     ) -> GenerateOutput:
         """Generate text autoregressively with KV caching.
 
@@ -213,8 +214,34 @@ class GeneratorMixin:
             prompt_length + jnp.array([sp.max_tokens for sp in sampling_params]),
         )
 
+        # Check for stop strings by detokenizing
+        stop_pos_array = stop_pos[:, 0].tolist()
+        if tokenizer is not None:
+            for i, sp in enumerate(sampling_params):
+                if sp.stop_strings and stop_pos_array[i] == -1:  # Only check if not already stopped
+                    # Detokenize the generated sequence so far
+                    seq_tokens = generated_ids[i, prompt_length : end_positions[i]].tolist()
+                    decoded_text = tokenizer.decode(seq_tokens, skip_special_tokens=False)
+
+                    # Check if any stop string is in the decoded text
+                    for stop_str in sp.stop_strings:
+                        stop_idx = decoded_text.find(stop_str)
+                        if stop_idx != -1:
+                            # Found a stop string - need to find which token position it corresponds to
+                            # Incrementally decode to find the exact token position
+                            for token_pos in range(len(seq_tokens)):
+                                partial_decoded = tokenizer.decode(
+                                    seq_tokens[: token_pos + 1], skip_special_tokens=False
+                                )
+                                if stop_str in partial_decoded:
+                                    # Update end position to stop at this token
+                                    end_positions = end_positions.at[i].set(prompt_length + token_pos + 1)
+                                    stop_pos_array[i] = prompt_length + token_pos
+                                    break
+                            break
+
         return GenerateOutput(
             generated_ids=[generated_ids[i, prompt_length : end_positions[i]].tolist() for i in range(batch_size)],
-            stop_reasons=["stop" if stop_pos[i, 0] >= 0 else "length" for i in range(batch_size)],
+            stop_reasons=["stop" if stop_pos_array[i] >= 0 else "length" for i in range(batch_size)],
             logprobs=[all_logprobs[i, prompt_length : end_positions[i]].tolist() for i in range(batch_size)],
         )
