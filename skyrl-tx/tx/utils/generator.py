@@ -230,10 +230,10 @@ class GeneratorMixin:
                             # Found a stop string - need to find which token position it corresponds to
                             # Incrementally decode to find the exact token position
                             for token_pos in range(len(seq_tokens)):
-                                partial_decoded = tokenizer.decode(
-                                    seq_tokens[: token_pos + 1], skip_special_tokens=False
-                                )
-                                if stop_str in partial_decoded:
+                                # partial_decoded = tokenizer.decode(
+                                #     seq_tokens[: token_pos + 1], skip_special_tokens=False
+                                # )
+                                if stop_str in decoded_text:
                                     # Update end position to stop at this token
                                     end_positions = end_positions.at[i].set(prompt_length + token_pos + 1)
                                     stop_pos_array[i] = prompt_length + token_pos
