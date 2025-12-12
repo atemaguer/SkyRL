@@ -14,6 +14,7 @@ import asyncio
 import subprocess
 import random
 import time
+import re
 
 from tx.tinker import types
 from tx.tinker.config import EngineConfig, add_model, config_to_argv
@@ -265,7 +266,25 @@ class OptimStepRequest(BaseModel):
 
 class SaveWeightsForSamplerRequest(BaseModel):
     model_id: str
-    path: str = Field(..., pattern=ID_PATTERN, max_length=ID_MAX_LENGTH)
+    path: str | None = Field(default=None, pattern=ID_PATTERN, max_length=ID_MAX_LENGTH)
+    sampling_session_seq_id: int | None = None
+    session_id: str | None = None
+
+    @model_validator(mode="after")
+    def generate_path_if_missing(self):
+        """Generate path from sampling_session_seq_id if not provided."""
+        if self.path is None:
+            if self.sampling_session_seq_id is None:
+                raise ValueError("Either 'path' or 'sampling_session_seq_id' must be provided")
+            # Generate path from sampling_session_seq_id
+            generated_path = f"sampler_{self.sampling_session_seq_id}"
+            # Validate generated path matches pattern
+            if not re.match(ID_PATTERN, generated_path):
+                raise ValueError(f"Generated path '{generated_path}' does not match pattern {ID_PATTERN}")
+            if len(generated_path) > ID_MAX_LENGTH:
+                raise ValueError(f"Generated path '{generated_path}' exceeds max length {ID_MAX_LENGTH}")
+            self.path = generated_path
+        return self
 
 
 class SamplingParams(BaseModel):
@@ -648,6 +667,68 @@ async def save_weights(request: SaveWeightsRequest, session: AsyncSession = Depe
 @app.post("/api/v1/save_weights_for_sampler", response_model=FutureResponse)
 async def save_weights_for_sampler(request: SaveWeightsForSamplerRequest, session: AsyncSession = Depends(get_session)):
     """Saves weights in a format compatible with sampling/inference servers."""
+    # Path is guaranteed to be set after model validation
+    assert request.path is not None, "path should be set by validator"
+
+    # If using sampling_session_seq_id, create or find the sampling session
+    sampling_session_id = None
+    if request.sampling_session_seq_id is not None:
+        # If session_id is not provided, find the most recent active session
+        actual_session_id = request.session_id
+        if actual_session_id is None:
+            # Find the most recent active session
+            statement = (
+                select(SessionDB)
+                .where(SessionDB.status == "active")
+                .order_by(SessionDB.last_heartbeat_at.desc().nulls_last(), SessionDB.created_at.desc())
+                .limit(1)
+            )
+            result = await session.exec(statement)
+            recent_session = result.first()
+            if recent_session:
+                actual_session_id = recent_session.session_id
+            else:
+                # No active session found, create a temporary one
+                actual_session_id = f"session_{uuid4().hex[:8]}"
+                session_db = SessionDB(
+                    session_id=actual_session_id,
+                    tags=[],
+                    user_metadata={},
+                    sdk_version="unknown",
+                    status="active",
+                )
+                session.add(session_db)
+        else:
+            # Check if provided session exists
+            session_db = await session.get(SessionDB, actual_session_id)
+            if session_db is None:
+                raise HTTPException(status_code=404, detail="Session not found")
+
+        # Check if sampling session already exists for this session_id and sampling_session_seq_id
+        statement = select(SamplingSessionDB).where(
+            SamplingSessionDB.session_id == actual_session_id,
+            SamplingSessionDB.sampling_session_seq_id == request.sampling_session_seq_id,
+        )
+        result = await session.exec(statement)
+        existing_sampling_session = result.first()
+
+        if existing_sampling_session:
+            sampling_session_id = existing_sampling_session.sampling_session_id
+        else:
+            # Create new sampling session
+            # Use the checkpoint path as model_path for the sampling session
+            model_path = f"tinker://{request.model_id}/sampler_weights/{request.path}"
+
+            sampling_session_id = f"sampling_{uuid4().hex[:8]}"
+            sampling_db = SamplingSessionDB(
+                sampling_session_id=sampling_session_id,
+                session_id=actual_session_id,
+                sampling_session_seq_id=request.sampling_session_seq_id,
+                base_model=None,
+                model_path=model_path,
+            )
+            session.add(sampling_db)
+
     # Create pending checkpoint entry (validates model exists)
     await create_checkpoint(
         session=session,
@@ -660,7 +741,12 @@ async def save_weights_for_sampler(request: SaveWeightsForSamplerRequest, sessio
         session=session,
         request_type=types.RequestType.SAVE_WEIGHTS_FOR_SAMPLER,
         model_id=request.model_id,
-        request_data=types.SaveWeightsForSamplerInput(path=request.path),
+        request_data=types.SaveWeightsForSamplerInput(
+            path=request.path,
+            sampling_session_seq_id=request.sampling_session_seq_id,
+            session_id=request.session_id,
+            sampling_session_id=sampling_session_id,
+        ),
     )
 
     await session.commit()

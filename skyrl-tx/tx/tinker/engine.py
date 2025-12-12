@@ -872,8 +872,10 @@ class TinkerEngine:
                 f"Saved LoRA adapter weights for model {model_id} (adapter {lora_model.adapter_index}) to {output_path}"
             )
 
+        # Return path=None when using sampling_session_seq_id (client uses sampling session instead)
         return types.SaveWeightsForSamplerOutput(
-            path=f"tinker://{model_id}/{checkpoint_id}",
+            path=None if request_data.sampling_session_seq_id is not None else f"tinker://{model_id}/{checkpoint_id}",
+            sampling_session_id=request_data.sampling_session_id,
             type="save_weights_for_sampler",
         )
 
